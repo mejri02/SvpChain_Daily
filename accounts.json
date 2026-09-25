@@ -1,0 +1,12 @@
+[
+  {
+    "label": "Account #1",
+    "address": "0x1234567890abcdef1234567890abcdef12345678",
+    "privateKey": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+  },
+  {
+    "label": "Account #2",
+    "address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+    "privateKey": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+  }
+]
