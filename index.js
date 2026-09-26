@@ -65,7 +65,6 @@ const BRIDGE_DST_TOKEN          = "0x7a8ecfa70374c1b8702cb98aaf23de19675981d6";
 const BRIDGE_AMOUNT_MIN         = ethers.parseEther(process.env.BRIDGE_MIN_SVP || "0.1");
 const BRIDGE_AMOUNT_MAX         = ethers.parseEther(process.env.BRIDGE_MAX_SVP || "0.15");
 const BRIDGE_MIN_NATIVE_RESERVE = ethers.parseEther("0.02");
-const BRIDGE_API_BASE           = "https://pre-bridge.svpstars.com/api";
 const BRIDGE_VERIFY_WAIT_MS     = 90_000;
 
 const FAUCET_TOKENS = [
@@ -819,32 +818,6 @@ function encodeBridgeCalldata(dstChainId, dstToken, recipient) {
   return `0x${selector}${chainIdParam}${dstTokenParam}${recipientParam}${reservedParam}`;
 }
 
-async function bridgeApiCheckTransactions(address) {
-  try {
-    const res = await axios.get(
-      `${BRIDGE_API_BASE}/bridge/transactions/address/${address}?page=1&page_size=10`,
-      { headers: baseHeaders({ origin: "https://bridge.svpstars.com", referer: "https://bridge.svpstars.com/" }),
-        timeout: 15000, validateStatus: () => true }
-    );
-    if (res.status !== 200) return [];
-    const items = res.data?.result?.items || res.data?.items || [];
-    return Array.isArray(items) ? items : [];
-  } catch { return []; }
-}
-
-async function bridgeApiCheckDeposits(address) {
-  try {
-    const res = await axios.get(
-      `${BRIDGE_API_BASE}/deposits/address/${address}?page=1&page_size=10&deposit_source=bridge`,
-      { headers: baseHeaders({ origin: "https://bridge.svpstars.com", referer: "https://bridge.svpstars.com/" }),
-        timeout: 15000, validateStatus: () => true }
-    );
-    if (res.status !== 200) return [];
-    const items = res.data?.result?.items || res.data?.items || [];
-    return Array.isArray(items) ? items : [];
-  } catch { return []; }
-}
-
 async function performBridge(privateKey, provider) {
   const wallet = new ethers.Wallet(privateKey, provider);
   const recipient = wallet.address;
@@ -1070,13 +1043,21 @@ async function handleBridgeTask(client, task, address, privateKey, provider) {
     return;
   }
 
+  // If the backend already records progress for THIS task period, verify only.
+  // NOTE: we intentionally do NOT consult the bridge sub-API here — it returns
+  // historical txs and would incorrectly skip bridging on subsequent days.
   const progress = task.productState?.progress ?? 0;
   const target = task.productState?.target ?? 1;
+  const processing = task.productState?.bridgeSummary?.processingCount ?? 0;
 
-  const apiTxs = await bridgeApiCheckTransactions(address);
-  const apiDeps = await bridgeApiCheckDeposits(address);
-  if (apiTxs.length > 0 || apiDeps.length > 0 || progress >= target) {
-    log(`\n${C.cyan}🌉 ─── bridge evidence found — verifying ───${C.reset}`);
+  if (progress >= target) {
+    log(`\n${C.cyan}🌉 ─── bridge progress ${progress}/${target} — verifying ───${C.reset}`);
+    await handleVerifyThenClaim(client, task);
+    return;
+  }
+
+  if (processing > 0) {
+    log(`\n${C.cyan}🌉 ─── bridge already processing (${processing}) — verifying ───${C.reset}`);
     await handleVerifyThenClaim(client, task);
     return;
   }
@@ -1383,7 +1364,7 @@ async function runCycle(ctx, cycleNum) {
 }
 
 async function main() {
-  log(`${C.cyan}${C.bold}🌟 SVP Rewards — daily auto-farmer (v4)${C.reset}`);
+  log(`${C.cyan}${C.bold}🌟 SVP Rewards — daily auto-farmer (v4.1)${C.reset}`);
   log(`⛓️  Chain ID  : ${CHAIN_ID}`);
   log(`🌐 RPC       : ${RPC_URL}`);
   log(`🔀 Router    : ${ROUTER_ADDRESS}`);
