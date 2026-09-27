@@ -9,7 +9,6 @@ import { solveChallenge, pbkdf2 } from "altcha/lib";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const ACCOUNTS_FILE        = "accounts.json";
-const BYTECODE_FILE        = "bytecode.txt";
 const GROQ_FILE            = "groq.txt";
 const TXHASH_FILE          = "txhashes.json";
 const FAUCET_COOLDOWN_FILE = "faucet_cooldowns.json";
@@ -19,11 +18,15 @@ const FAUCET_ENDPOINT = "https://www.svpchain.org/api/claim";
 const ALTCHA_BASE     = "https://www.svpchain.org/api/altcha/challenge";
 const GROQ_URL        = "https://api.groq.com/openai/v1/chat/completions";
 const EXPLORER        = "https://explorer.svpchain.com/tx";
+const EXPLORER_API    = "https://explorer.svpchain.com/api";
 
-const CHAIN_ID           = 2517;
-const RPC_URL            = process.env.RPC_URL || "https://svp-dataseed1-testnet.svpchain.org";
-const MIN_GAS_PRICE      = ethers.parseUnits("2", "gwei");
-const GAS_LIMIT_FALLBACK = 2_500_000n;
+const CHAIN_ID = 2517;
+const RPC_URLS = [
+  process.env.RPC_URL || "https://svp-dataseed1-testnet.svpchain.org",
+  "https://svp-dataseeds-testnet.svpchain.org",
+].filter(Boolean);
+
+const MIN_GAS_PRICE = ethers.parseUnits("2", "gwei");
 
 const GROQ_MODEL    = process.env.GROQ_MODEL    || "openai/gpt-oss-120b";
 const GROQ_FALLBACK = process.env.GROQ_FALLBACK || "openai/gpt-oss-20b";
@@ -75,21 +78,21 @@ const FAUCET_TOKENS = [
   { symbol: "WBNB", address: "0x8787384b8640f6e9c30e94585d3d62b03f80a5df" },
 ];
 
-const INTER_TOKEN_DELAY       = 60_000;
-const RETRY_WAIT_RATE_LIMIT   = 90_000;
+const INTER_TOKEN_DELAY       = 10_000;
 const RETRY_WAIT_SERVER_ERR   = 15_000;
-const RETRYABLE_STATUS        = new Set([429, 500, 502, 503, 504]);
+const RETRYABLE_STATUS        = new Set([500, 502, 503, 504]);
 const MAX_CLAIM_ATTEMPTS      = 3;
 const MAX_ALTCHA_ATTEMPTS     = 3;
 const ALTCHA_SOLVE_TIMEOUT_MS = 45_000;
 const FAUCET_COOLDOWN_MS      = 24 * 60 * 60 * 1000;
+
+const RPC_CALL_TIMEOUT_MS = 15_000;
 
 const args    = process.argv.slice(2);
 const getArg  = (name, fb = null) => { const i = args.indexOf(name); return i >= 0 && args[i + 1] ? args[i + 1] : fb; };
 const hasFlag = (name) => args.includes(name);
 
 const DRY_RUN     = hasFlag("--dry");
-const SKIP_DEPLOY = hasFlag("--skip-deploy");
 const DO_LEND     = !hasFlag("--no-lend");
 const DO_BRIDGE   = !hasFlag("--no-bridge");
 const DO_SWAP     = !hasFlag("--no-swap");
@@ -103,6 +106,7 @@ const COOLDOWN_BETWEEN_ACCOUNTS = 30_000;
 
 const SKIP_ACTIONS = new Set([
   "bind_x", "x_follow", "tg_join", "discord_join", "tweet",
+  "contract_deploy",
 ]);
 
 const C = {
@@ -189,18 +193,6 @@ function loadAccounts() {
   return out;
 }
 
-function loadBytecode() {
-  const t = readText(BYTECODE_FILE);
-  if (!t) return null;
-  let hex = t.trim().replace(/\s+/g, "");
-  if (!hex) return null;
-  if (!hex.startsWith("0x")) hex = "0x" + hex;
-  if (!/^0x[0-9a-fA-F]+$/.test(hex)) throw new Error(`${BYTECODE_FILE} not valid hex`);
-  if ((hex.length - 2) % 2 !== 0) throw new Error(`${BYTECODE_FILE} odd hex length`);
-  if ((hex.length - 2) / 2 < 32) throw new Error(`${BYTECODE_FILE} too short`);
-  return hex;
-}
-
 const TXHASHES = (() => {
   const data = loadJson(TXHASH_FILE, {}) || {};
   return {
@@ -212,6 +204,19 @@ const TXHASHES = (() => {
       data[key] = data[key] || {};
       data[key][k] = v;
       saveJson(TXHASH_FILE, data);
+    },
+    clearFaucetKeys(wallet) {
+      const key = wallet.toLowerCase();
+      if (!data[key]) return 0;
+      let removed = 0;
+      for (const k of Object.keys(data[key])) {
+        if (k.startsWith("faucet_")) {
+          delete data[key][k];
+          removed++;
+        }
+      }
+      if (removed > 0) saveJson(TXHASH_FILE, data);
+      return removed;
     },
   };
 })();
@@ -275,6 +280,20 @@ function extractRevertReason(error) {
   if (error?.shortMessage) return error.shortMessage;
   if (error?.info?.error?.message) return error.info.error.message;
   return error?.message || "revert (no reason)";
+}
+
+async function safeGetBalance(provider, address) {
+  try { return await provider.getBalance(address); }
+  catch { return null; }
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 const SVP_SYSTEM_PROMPT = `You are a precise multiple-choice quiz solver for SVP Chain — a crypto L1 focused on AI-native trading.
@@ -486,19 +505,25 @@ async function faucetClaimOne(address, tokenAddress, symbol) {
     }
   }
 
-  const { status, data } = await httpJson("POST", FAUCET_ENDPOINT, {
-    headers: {
-      "content-type": "application/json",
-      "origin": "https://www.svpchain.org",
-      "referer": "https://www.svpchain.org/faucet",
-    },
-    body: JSON.stringify({
-      chain: "svp-testnet",
-      token: tokenAddress,
-      address,
-      altcha: altchaToken,
-    }),
-  });
+  let status = 0, data = {};
+  try {
+    const r = await httpJson("POST", FAUCET_ENDPOINT, {
+      headers: {
+        "content-type": "application/json",
+        "origin": "https://www.svpchain.org",
+        "referer": "https://www.svpchain.org/faucet",
+      },
+      body: JSON.stringify({
+        chain: "svp-testnet",
+        token: tokenAddress,
+        address,
+        altcha: altchaToken,
+      }),
+    });
+    status = r.status; data = r.data;
+  } catch (e) {
+    return { ok: false, symbol, status: 0, errMsg: e.message };
+  }
 
   const json = data || {};
   const txHash = json.tx_hash || json.txHash || json.hash || json.data?.txHash || json.data?.tx_hash || null;
@@ -510,11 +535,14 @@ async function faucetClaimWithRetry(address, token, attempts = MAX_CLAIM_ATTEMPT
   for (let i = 1; i <= attempts; i++) {
     const r = await faucetClaimOne(address, token.address, token.symbol);
     if (r.ok) return r;
+
     if (r.status === 400 && /not enabled/i.test(r.errMsg || "")) return r;
+    if (r.status === 400 && /already|too soon|cooldown|recently/i.test(r.errMsg || "")) return r;
+    if (r.status === 429) return r;
+
     if (RETRYABLE_STATUS.has(r.status) && i < attempts) {
-      const wait = r.status === 429 ? RETRY_WAIT_RATE_LIMIT : RETRY_WAIT_SERVER_ERR;
-      log(`   ${C.yellow}⚠️  ${token.symbol}: HTTP ${r.status} — retry ${i}/${attempts} in ${wait / 1000}s${C.reset}`);
-      await sleep(wait);
+      log(`   ${C.yellow}⚠️  ${token.symbol}: HTTP ${r.status} — retry ${i}/${attempts} in ${RETRY_WAIT_SERVER_ERR / 1000}s${C.reset}`);
+      await sleep(RETRY_WAIT_SERVER_ERR);
       continue;
     }
     return r;
@@ -522,9 +550,39 @@ async function faucetClaimWithRetry(address, token, attempts = MAX_CLAIM_ATTEMPT
   return { ok: false, symbol: token.symbol, errMsg: "max retries exceeded" };
 }
 
+/**
+ * Recover a real faucet drip tx from the explorer.
+ * Faucet wallet is 0x8b52753dcbad46925821f02b7b7d90bad8804bfe — every drip
+ * comes from it. ERC-20 drips (USDC/USDV/WBTC/WBNB) appear in tokentx.
+ */
+async function findRecentFaucetTx(address) {
+  const FAUCET_WALLET = "0x8b52753dcbad46925821f02b7b7d90bad8804bfe";
+  try {
+    const url = `${EXPLORER_API}?module=account&action=tokentx` +
+                `&address=${encodeURIComponent(address)}` +
+                `&sort=desc&page=1&offset=50`;
+    const { status, data } = await httpJson("GET", url, {
+      headers: { accept: "application/json" },
+    });
+    if (status !== 200) return null;
+    const items = data?.result;
+    if (!Array.isArray(items) || items.length === 0) return null;
+
+    for (const tx of items) {
+      if (!tx?.hash) continue;
+      if ((tx.to || "").toLowerCase() !== address.toLowerCase()) continue;
+      if ((tx.from || "").toLowerCase() !== FAUCET_WALLET) continue;
+      return tx.hash;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 async function faucetClaimAll(address, task = null) {
   const results = [];
-  let nativeHash = null;
+  const txHashes = [];
   const taskDone = task && task.userStatus === "done";
 
   for (let i = 0; i < FAUCET_TOKENS.length; i++) {
@@ -534,6 +592,17 @@ async function faucetClaimAll(address, task = null) {
     if (FAUCET_COOLDOWNS.isFresh(address, t.address)) {
       const ago = Math.round((Date.now() - FAUCET_COOLDOWNS.get(address, t.address)) / 60000);
       log(`   ${C.dim}⏭️  skip faucet ${t.symbol}: claimed ${ago}m ago${C.reset}`);
+
+      let cached = TXHASHES.get(address, `faucet_${t.symbol}`);
+      if (!cached) cached = TXHASHES.get(address, "faucet_last");
+      if (!cached) {
+        cached = await findRecentFaucetTx(address);
+        if (cached) {
+          log(`   ${C.cyan}💧 recovered ${t.symbol} tx from explorer: ${cached}${C.reset}`);
+          TXHASHES.set(address, `faucet_${t.symbol}`, cached);
+        }
+      }
+      if (cached) txHashes.push({ symbol: t.symbol, hash: cached });
       continue;
     }
 
@@ -543,9 +612,21 @@ async function faucetClaimAll(address, task = null) {
       if (r.ok) {
         log(`   ${C.green}💧 faucet ${t.symbol}: ${EXPLORER}/${r.txHash}${C.reset}`);
         FAUCET_COOLDOWNS.set(address, t.address, Date.now());
-        if (t.symbol === "SVP") nativeHash = r.txHash;
+        TXHASHES.set(address, `faucet_${t.symbol}`, r.txHash);
+        TXHASHES.set(address, "faucet_last", r.txHash);
+        txHashes.push({ symbol: t.symbol, hash: r.txHash });
       } else if (r.status === 400 && /not enabled/i.test(r.errMsg || "")) {
         log(`   ${C.yellow}🚫 faucet ${t.symbol}: disabled${C.reset}`);
+      } else if (r.status === 429) {
+        log(`   ${C.dim}⏭️  faucet ${t.symbol}: rate-limited (already claimed recently)${C.reset}`);
+        FAUCET_COOLDOWNS.set(address, t.address, Date.now());
+        const cached = TXHASHES.get(address, `faucet_${t.symbol}`) || TXHASHES.get(address, "faucet_last");
+        if (cached) txHashes.push({ symbol: t.symbol, hash: cached });
+      } else if (r.status === 400 && /already|too soon|cooldown|recently/i.test(r.errMsg || "")) {
+        log(`   ${C.dim}⏭️  faucet ${t.symbol}: cooldown — ${r.errMsg}${C.reset}`);
+        FAUCET_COOLDOWNS.set(address, t.address, Date.now());
+        const cached = TXHASHES.get(address, `faucet_${t.symbol}`) || TXHASHES.get(address, "faucet_last");
+        if (cached) txHashes.push({ symbol: t.symbol, hash: cached });
       } else {
         log(`   ${C.yellow}❌ faucet ${t.symbol}: HTTP ${r.status}${r.errMsg ? ` — ${r.errMsg}` : ""}${C.reset}`);
       }
@@ -555,11 +636,10 @@ async function faucetClaimAll(address, task = null) {
     }
 
     if (i < FAUCET_TOKENS.length - 1) {
-      log(`   ${C.dim}⏳ waiting ${INTER_TOKEN_DELAY / 1000}s before next token…${C.reset}`);
       await sleep(INTER_TOKEN_DELAY);
     }
   }
-  return { results, nativeHash };
+  return { results, txHashes, anySuccess: txHashes.length > 0 };
 }
 
 const swapLog = (...a) => log(`   ${C.cyan}🔄 [swap]${C.reset}`, ...a);
@@ -625,7 +705,8 @@ async function executeSwapLeg(wallet, provider, fromSymbol, toSymbol, amountIn) 
     gasLimit = 500_000n;
   }
 
-  const fee = await provider.getFeeData();
+  let fee = {};
+  try { fee = await provider.getFeeData(); } catch {}
   let maxFeePerGas = fee.maxFeePerGas ?? MIN_GAS_PRICE;
   let maxPriorityFeePerGas = fee.maxPriorityFeePerGas ?? ethers.parseUnits("0.125", "gwei");
   if (maxFeePerGas < MIN_GAS_PRICE) maxFeePerGas = MIN_GAS_PRICE;
@@ -649,7 +730,11 @@ async function performDistinctSwaps(privateKey, provider) {
   const wallet = new ethers.Wallet(privateKey, provider);
   const hashes = [];
 
-  const bal = await provider.getBalance(wallet.address);
+  const bal = await safeGetBalance(provider, wallet.address);
+  if (bal == null) {
+    swapLog(`${C.yellow}balance check failed — aborting swaps${C.reset}`);
+    return hashes;
+  }
   const needWSVP = SWAP_LEGS.reduce((a, l) => a + l.amount, 0n);
   const needTotal = needWSVP + SWAP_MIN_RESERVE;
   if (bal < needTotal) {
@@ -676,48 +761,6 @@ async function performDistinctSwaps(privateKey, provider) {
 
   swapLog(`${C.green}${hashes.length} swap tx(s) landed${C.reset}`);
   return hashes;
-}
-
-async function deployContract(bytecode, privateKey, provider) {
-  const wallet = new ethers.Wallet(privateKey, provider);
-  const bal = await provider.getBalance(wallet.address);
-  log(`   🚀 deploy from ${wallet.address}`);
-  log(`   💰 balance   : ${ethers.formatEther(bal)} SVP`);
-
-  if (bal === 0n) {
-    log(`   ${C.yellow}⚠️  0 balance — faucet first${C.reset}`);
-    return null;
-  }
-
-  const fee = await provider.getFeeData();
-  let maxFeePerGas = fee.maxFeePerGas ?? MIN_GAS_PRICE;
-  let maxPriorityFeePerGas = fee.maxPriorityFeePerGas ?? ethers.parseUnits("1", "gwei");
-  if (maxFeePerGas < MIN_GAS_PRICE) maxFeePerGas = MIN_GAS_PRICE;
-
-  let gasLimit;
-  try {
-    const est = await provider.estimateGas({ from: wallet.address, data: bytecode });
-    gasLimit = (est * 130n) / 100n;
-    log(`   ⛽ gas est.  : ${est} (using ${gasLimit})`);
-  } catch {
-    gasLimit = GAS_LIMIT_FALLBACK;
-    log(`   ${C.yellow}⛽ gas est. failed — using ${gasLimit}${C.reset}`);
-  }
-
-  const tx = await wallet.sendTransaction({
-    data: bytecode, gasLimit, type: 2, maxFeePerGas, maxPriorityFeePerGas,
-  });
-  log(`   ${C.cyan}📜 tx: ${tx.hash}${C.reset}`);
-  log(`   ${C.cyan}🔗 ${EXPLORER}/${tx.hash}${C.reset}`);
-
-  const rcpt = await tx.wait(1);
-  if (!rcpt || rcpt.status !== 1 || !rcpt.contractAddress) {
-    log(`   ${C.red}❌ deploy failed${C.reset}`);
-    return null;
-  }
-
-  log(`   ${C.green}✅ deployed at ${rcpt.contractAddress}${C.reset}`);
-  return tx.hash;
 }
 
 async function loginAccount(privateKey) {
@@ -828,7 +871,11 @@ async function performBridge(privateKey, provider) {
   const rand = span > 0n ? BigInt(Math.floor(Math.random() * Number(span))) : 0n;
   const amount = min + rand;
 
-  const bal = await provider.getBalance(wallet.address);
+  const bal = await safeGetBalance(provider, wallet.address);
+  if (bal == null) {
+    bridgeLog(`${C.yellow}balance check failed — skipping bridge${C.reset}`);
+    return null;
+  }
   if (bal < amount + BRIDGE_MIN_NATIVE_RESERVE) {
     bridgeLog(`${C.yellow}⏭️  skip: balance too low (have ${ethers.formatEther(bal)}, need ${ethers.formatEther(amount + BRIDGE_MIN_NATIVE_RESERVE)})${C.reset}`);
     return null;
@@ -839,7 +886,8 @@ async function performBridge(privateKey, provider) {
   bridgeLog(`bridging ${ethers.formatEther(amount)} SVP → chain ${BRIDGE_DEST_CHAIN_ID}`);
   bridgeLog(`data      : ${data.slice(0, 10)}…${data.slice(-16)}`);
 
-  const fee = await provider.getFeeData();
+  let fee = {};
+  try { fee = await provider.getFeeData(); } catch {}
   let maxFeePerGas = fee.maxFeePerGas ?? MIN_GAS_PRICE;
   let maxPriorityFeePerGas = fee.maxPriorityFeePerGas ?? ethers.parseUnits("0.125", "gwei");
   if (maxFeePerGas < MIN_GAS_PRICE) maxFeePerGas = MIN_GAS_PRICE;
@@ -903,24 +951,51 @@ async function handleQuiz(client, task, solver) {
 async function handleFaucet(client, task, address) {
   if (task.userStatus === "done") {
     log(`   💧 faucet task already done — skipping drips`);
-    return;
+    return true;
   }
 
   log(`   💧 faucet: requesting all token drips…`);
-  const { nativeHash } = await faucetClaimAll(address, task);
-
-  if (!nativeHash) {
-    log(`   ${C.yellow}😕 no native SVP drip this run${C.reset}`);
-    return;
-  }
+  const { txHashes } = await faucetClaimAll(address, task);
 
   await client.startTask(task.id).catch(() => {});
-  try {
-    const r = await client.claimTask(task.id, { txHash: nativeHash });
-    log(`   ${C.green}💧 faucet verified +${r.pointsAwarded} pts${C.reset}`);
-  } catch (e) {
-    log(`   ${C.red}💧 faucet claim failed: ${e.message}${C.reset}`);
+
+  if (txHashes.length === 0) {
+    log(`   ${C.red}😕 no faucet tx available (fresh or recovered) — cannot claim${C.reset}`);
+    return false;
   }
+
+  const ordered = [
+    ...txHashes.filter(h => h.symbol === "SVP"),
+    ...txHashes.filter(h => h.symbol !== "SVP"),
+  ];
+  const tried = new Set();
+
+  for (const h of ordered) {
+    if (tried.has(h.hash)) continue;
+    tried.add(h.hash);
+    log(`   ${C.cyan}💧 trying proof tx ${h.hash} (${h.symbol})${C.reset}`);
+    try {
+      const r = await client.claimTask(task.id, { txHash: h.hash });
+      log(`   ${C.green}💧 faucet verified +${r.pointsAwarded} pts${C.reset}`);
+      return true;
+    } catch (e) {
+      const msg = e.message || "";
+      if (/not sent to the official faucet contract/i.test(msg)) {
+        log(`   ${C.yellow}💧 ${h.symbol} hash rejected (not a faucet tx) — trying next${C.reset}`);
+        continue;
+      }
+      if (/invalid transaction hash/i.test(msg)) {
+        log(`   ${C.yellow}💧 ${h.symbol} hash rejected (invalid) — trying next${C.reset}`);
+        continue;
+      }
+      log(`   ${C.yellow}💧 claim with ${h.symbol} hash failed: ${msg}${C.reset}`);
+      break;
+    }
+  }
+
+  log(`   ${C.red}💧 no recovered hash was accepted by the backend${C.reset}`);
+  log(`   ${C.yellow}💡 A fresh faucet drip is needed. Try again in ~10 minutes when cooldown expires, or delete faucet_cooldowns.json to force a new drip.${C.reset}`);
+  return false;
 }
 
 async function handleVerifyThenClaim(client, task) {
@@ -1043,9 +1118,6 @@ async function handleBridgeTask(client, task, address, privateKey, provider) {
     return;
   }
 
-  // If the backend already records progress for THIS task period, verify only.
-  // NOTE: we intentionally do NOT consult the bridge sub-API here — it returns
-  // historical txs and would incorrectly skip bridging on subsequent days.
   const progress = task.productState?.progress ?? 0;
   const target = task.productState?.target ?? 1;
   const processing = task.productState?.bridgeSummary?.processingCount ?? 0;
@@ -1112,7 +1184,7 @@ async function handleBridgeTask(client, task, address, privateKey, provider) {
 }
 
 async function runAccount(account, idx, total, ctx) {
-  const { solver, bytecode, provider } = ctx;
+  const { solver, provider } = ctx;
 
   log(`\n${C.bold}🏦 ═════ [ ${idx + 1}/${total} ] ${account.label} ═════${C.reset}`);
 
@@ -1122,6 +1194,17 @@ async function runAccount(account, idx, total, ctx) {
 
   const { client, address } = conn;
   log(`📍 Address: ${address}`);
+
+  // ─── Start-of-cycle safety net: if all local faucet cooldowns have
+  // expired, the previous run's faucet hashes have been consumed by the
+  // backend and are no longer valid proof. Clear them so the next drip
+  // writes fresh ones. (Normally runCycle's end-of-cycle cleanup already
+  // did this — this catches crash-before-cleanup cases.)
+  const anyFresh = FAUCET_TOKENS.some(t => FAUCET_COOLDOWNS.isFresh(address, t.address));
+  if (!anyFresh) {
+    const n = TXHASHES.clearFaucetKeys(address);
+    if (n) log(`   ${C.dim}🧹 faucet cooldowns expired — cleared ${n} stale faucet key(s)${C.reset}`);
+  }
 
   try {
     const me = await client.me();
@@ -1141,20 +1224,32 @@ async function runAccount(account, idx, total, ctx) {
     return;
   }
 
+  // ─── Step 1: Faucet (gates everything else) ──────────────────────
   const faucetTask = tasks.find(t => t.actionType === "faucet_claim");
   if (faucetTask && faucetTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}💧 ─── Step 1: Faucet ───${C.reset}`);
-    try { await handleFaucet(client, faucetTask, address); }
+    let faucetOk = false;
+    try { faucetOk = await handleFaucet(client, faucetTask, address); }
     catch (e) { log(`   ${C.red}💧 faucet error: ${e.message}${C.reset}`); }
-    try { tasks = flattenTasks(await client.tasks()); } catch {}
+
     if (provider) {
-      const bal = await provider.getBalance(address);
-      log(`   ${C.cyan}💰 Balance after faucet: ${ethers.formatEther(bal)} SVP${C.reset}`);
+      const bal = await safeGetBalance(provider, address);
+      if (bal != null) log(`   ${C.cyan}💰 Balance after faucet: ${ethers.formatEther(bal)} SVP${C.reset}`);
+      else log(`   ${C.yellow}💰 balance check failed (RPC) — continuing${C.reset}`);
     }
+
+    if (!faucetOk) {
+      log(`\n${C.yellow}⚠️  Faucet task is not claimable — check-in / quiz / swap / lend / bridge are all LOCKED behind it.${C.reset}`);
+      log(`${C.yellow}⚠️  Skipping the rest of the daily chain for this account. Re-run once faucet claim goes through.${C.reset}`);
+      return;
+    }
+
+    try { tasks = flattenTasks(await client.tasks()); } catch {}
   } else if (faucetTask) {
     log(`\n${C.cyan}💧 ─── Step 1: Faucet skipped (done) ───${C.reset}`);
   }
 
+  // ─── Step 2: Check-in ─────────────────────────────────────────────
   const checkinTask = tasks.find(t => t.actionType === "checkin");
   if (checkinTask && checkinTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}📅 ─── Step 2: Check-in ───${C.reset}`);
@@ -1165,6 +1260,7 @@ async function runAccount(account, idx, total, ctx) {
     log(`\n${C.cyan}📅 ─── Step 2: Check-in skipped (done) ───${C.reset}`);
   }
 
+  // ─── Step 3: Quiz ─────────────────────────────────────────────────
   const quizTask = tasks.find(t => t.actionType === "quiz");
   if (quizTask && quizTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}🧠 ─── Step 3: Quiz ───${C.reset}`);
@@ -1175,6 +1271,7 @@ async function runAccount(account, idx, total, ctx) {
     log(`\n${C.cyan}🧠 ─── Step 3: Quiz skipped (done) ───${C.reset}`);
   }
 
+  // ─── Step 4: Swap ─────────────────────────────────────────────────
   const swapTask = tasks.find(t => t.actionType === "swap_check");
   if (swapTask && swapTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}🔄 ─── Step 4: Auto-Swap ───${C.reset}`);
@@ -1186,6 +1283,7 @@ async function runAccount(account, idx, total, ctx) {
     log(`\n${C.cyan}🔄 ─── Step 4: Auto-Swap skipped (done) ───${C.reset}`);
   }
 
+  // ─── Step 5: Lendora ──────────────────────────────────────────────
   const lendTask = tasks.find(t => t.actionType === "lending_check");
   if (!DO_LEND) {
     log(`\n${C.cyan}🏦 ─── Step 5: Lendora disabled ───${C.reset}`);
@@ -1207,6 +1305,7 @@ async function runAccount(account, idx, total, ctx) {
     }
   }
 
+  // ─── Step 6: Bridge ───────────────────────────────────────────────
   const bridgeTask = tasks.find(t => t.actionType === "bridge_check");
   if (bridgeTask && bridgeTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}🌉 ─── Step 6: Bridge ───${C.reset}`);
@@ -1216,6 +1315,7 @@ async function runAccount(account, idx, total, ctx) {
     log(`\n${C.cyan}🌉 ─── Step 6: Bridge skipped (done) ───${C.reset}`);
   }
 
+  // ─── Step 7: Remaining tasks ──────────────────────────────────────
   log(`\n${C.bold}${C.green}📋 ─── Step 7: Remaining tasks ───${C.reset}`);
   let didAnything = false;
   for (const t of tasks) {
@@ -1234,24 +1334,6 @@ async function runAccount(account, idx, total, ctx) {
         case "onchain_tx_count":
           await handleVerifyThenClaim(client, t);
           break;
-
-        case "contract_deploy": {
-          const cached = TXHASHES.get(address, "contract_deploy");
-          if (cached) {
-            log(`   ${C.cyan}📦 using cached deploy tx ${cached}${C.reset}`);
-            try {
-              await client.startTask(t.id).catch(() => {});
-              const r = await client.claimTask(t.id, { txHash: cached });
-              log(`   ${C.green}✅ claim ${t.title} +${r.pointsAwarded}${C.reset}`);
-            } catch (e) {
-              log(`   ${C.yellow}📦 claim ${t.title}: ${e.message}${C.reset}`);
-            }
-          } else {
-            log(`   ${C.dim}📦 no cached deploy tx — Step 8 will deploy${C.reset}`);
-          }
-          break;
-        }
-
         default:
           await handleGeneric(client, t);
       }
@@ -1261,63 +1343,8 @@ async function runAccount(account, idx, total, ctx) {
   }
   if (!didAnything) log(`   ${C.dim}(nothing left)${C.reset}`);
 
-  const deployTask = tasks.find(t => t.actionType === "contract_deploy");
-  const deployDone = deployTask && deployTask.userStatus === "done";
-
-  if (deployDone) {
-    log(`\n${C.cyan}🚀 ─── Step 8: Deploy skipped (task done) ───${C.reset}`);
-  } else if (!SKIP_DEPLOY && bytecode) {
-    if (TXHASHES.has(address, "contract_deploy")) {
-      const cached = TXHASHES.get(address, "contract_deploy");
-      log(`\n${C.cyan}🚀 ─── Step 8: Deploy skipped (cached: ${cached.slice(0, 10)}…) ───${C.reset}`);
-
-      if (deployTask && deployTask.userStatus !== "done") {
-        try {
-          await client.startTask(deployTask.id).catch(() => {});
-          const v = await client.verifyTask(deployTask.id);
-          log(`   🔍 verify ${deployTask.title} → ${v.userStatus}` +
-              (v.productState ? ` (${v.productState.progress ?? "?"}/${v.productState.target ?? "?"}${v.productState.reasonCode ? `, reason=${v.productState.reasonCode}` : ""})` : ""));
-        } catch (e) {
-          log(`   ${C.yellow}🔍 verify: ${e.message}${C.reset}`);
-        }
-
-        try {
-          const r = await client.claimTask(deployTask.id, { txHash: cached });
-          log(`   ${C.green}✅ claim ${deployTask.title} +${r.pointsAwarded}${C.reset}`);
-        } catch (e) {
-          log(`   ${C.yellow}📦 claim: ${e.message}${C.reset}`);
-        }
-      }
-    } else {
-      log(`\n${C.bold}${C.green}🚀 ─── Step 8: Deploy contract (LAST) ───${C.reset}`);
-      try {
-        const hash = await deployContract(bytecode, account.privateKey, provider);
-        if (hash) {
-          TXHASHES.set(address, "contract_deploy", hash);
-          log(`   ${C.green}✔ cached${C.reset}`);
-          if (deployTask && deployTask.userStatus !== "done") {
-            await sleep(5000);
-            try {
-              await client.startTask(deployTask.id).catch(() => {});
-              await handleVerifyThenClaim(client, deployTask);
-              try {
-                const r = await client.claimTask(deployTask.id, { txHash: hash });
-                log(`   ${C.green}✅ claim ${deployTask.title} +${r.pointsAwarded}${C.reset}`);
-              } catch (e) {
-                log(`   ${C.yellow}📦 claim: ${e.message}${C.reset}`);
-              }
-            } catch {}
-          }
-        }
-      } catch (e) { log(`   ${C.red}🚀 deploy error: ${e.message}${C.reset}`); }
-    }
-  } else if (!bytecode) {
-    log(`\n${C.cyan}🚀 ─── Step 8: Deploy skipped (no bytecode.txt) ───${C.reset}`);
-  } else if (SKIP_DEPLOY) {
-    log(`\n${C.cyan}🚀 ─── Step 8: Deploy skipped (--skip-deploy) ───${C.reset}`);
-  }
-
-  log(`\n${C.bold}${C.green}🎁 ─── Step 9: Region chests ───${C.reset}`);
+  // ─── Step 8: Region chests ────────────────────────────────────────
+  log(`\n${C.bold}${C.green}🎁 ─── Step 8: Region chests ───${C.reset}`);
   await claimAllRegionChests(client);
 }
 
@@ -1360,17 +1387,49 @@ async function runCycle(ctx, cycleNum) {
       await sleep(COOLDOWN_BETWEEN_ACCOUNTS);
     }
   }
+
+  // ─── End-of-cycle cleanup ─────────────────────────────────────────
+  // Every task for today is done; we're about to sleep for ~24h. Drop
+  // cached faucet hashes so tomorrow's fresh drip writes new ones.
+  // swap_last / bridge_last / anything else is kept — harmless and
+  // useful for late re-verification.
+  log(`\n${C.dim}🧹 End-of-cycle cleanup — clearing faucet hashes for next run…${C.reset}`);
+  for (const acc of accounts) {
+    const n = TXHASHES.clearFaucetKeys(acc.address);
+    if (n) log(`   ${C.dim}cleared ${n} faucet key(s) for ${acc.address.slice(0, 10)}…${C.reset}`);
+  }
+
   log(`\n${C.green}${C.bold}✅ Cycle #${cycleNum} complete.${C.reset}`);
 }
 
+function buildProvider() {
+  if (RPC_URLS.length === 1) {
+    return new ethers.JsonRpcProvider(RPC_URLS[0], CHAIN_ID, {
+      staticNetwork: true,
+      timeout: RPC_CALL_TIMEOUT_MS,
+    });
+  }
+  const configs = RPC_URLS.map((url, i) => ({
+    provider: new ethers.JsonRpcProvider(url, CHAIN_ID, {
+      staticNetwork: true,
+      timeout: RPC_CALL_TIMEOUT_MS,
+    }),
+    priority: i + 1,
+    stallTimeout: 4000,
+    weight: 1,
+  }));
+  return new ethers.FallbackProvider(configs, CHAIN_ID, { quorum: 1 });
+}
+
 async function main() {
-  log(`${C.cyan}${C.bold}🌟 SVP Rewards — daily auto-farmer (v4.1)${C.reset}`);
+  log(`${C.cyan}${C.bold}🌟 SVP Rewards — daily auto-farmer (v4.7)${C.reset}`);
   log(`⛓️  Chain ID  : ${CHAIN_ID}`);
-  log(`🌐 RPC       : ${RPC_URL}`);
+  log(`🌐 RPCs      : ${RPC_URLS.join(", ")}`);
   log(`🔀 Router    : ${ROUTER_ADDRESS}`);
   log(`🌉 Bridge    : ${BRIDGE_CONTRACT}`);
   log(`🧪 Dry run   : ${DRY_RUN ? "YES" : "no"}`);
   log(`🔄 Run mode  : ${RUN_ONCE ? "ONCE" : "LOOP (daily)"}`);
+  log(`⏰ Reset UTC : ${RESET_HOUR}:00`);
   log(`💱 Do swap   : ${DO_SWAP ? "YES" : "no"}`);
   log(`🏦 Do lend   : ${DO_LEND ? "YES" : "no"}`);
   log(`🌉 Do bridge : ${DO_BRIDGE ? "YES" : "no"}`);
@@ -1385,24 +1444,21 @@ async function main() {
   log(`👥 Loaded ${accounts.length} account(s)`);
   if (accounts.length === 0) throw new Error("No valid accounts.");
 
-  const bytecode = loadBytecode();
-  if (bytecode) log(`${C.green}📦 Bytecode: ${(bytecode.length - 2) / 2} bytes${C.reset}`);
-  else log(`${C.yellow}📦 Bytecode: not found${C.reset}`);
-
   let provider = null;
-  if ((bytecode && !SKIP_DEPLOY) || DO_LEND || DO_BRIDGE || DO_SWAP) {
-    provider = new ethers.JsonRpcProvider(RPC_URL, CHAIN_ID, { staticNetwork: true });
+  if (DO_LEND || DO_BRIDGE || DO_SWAP) {
+    provider = buildProvider();
     try {
-      const net = await provider.getNetwork();
+      const net = await withTimeout(provider.getNetwork(), RPC_CALL_TIMEOUT_MS, "RPC init");
       if (Number(net.chainId) !== CHAIN_ID) throw new Error(`chainId ${net.chainId}`);
       log(`${C.green}🌐 RPC OK: chainId ${net.chainId}${C.reset}`);
     } catch (e) {
       log(`${C.red}🌐 RPC fail: ${e.message}${C.reset}`);
+      log(`${C.yellow}⚠️  Continuing without provider — swap/lend/bridge will be skipped.${C.reset}`);
       provider = null;
     }
   }
 
-  const ctx = { solver, bytecode, provider, accounts };
+  const ctx = { solver, provider, accounts };
 
   if (RUN_ONCE) {
     await runCycle(ctx, 1);
