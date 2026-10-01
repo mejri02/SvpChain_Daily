@@ -1,10 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
+import readline from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 import { fileURLToPath } from "node:url";
 import { ethers } from "ethers";
 import { privateKeyToAccount } from "viem/accounts";
 import axios from "axios";
-import { solveChallenge, pbkdf2 } from "altcha/lib";
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
+import { solveChallenge } from "altcha-lib";
+import { deriveKey as pbkdf2DeriveKey } from "altcha-lib/algorithms/pbkdf2";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -12,6 +17,7 @@ const ACCOUNTS_FILE        = "accounts.json";
 const GROQ_FILE            = "groq.txt";
 const TXHASH_FILE          = "txhashes.json";
 const FAUCET_COOLDOWN_FILE = "faucet_cooldowns.json";
+const PROXY_FILE           = "proxy.txt";
 
 const API_BASE        = "https://rewards.svpstars.com/api/v1";
 const FAUCET_ENDPOINT = "https://www.svpchain.org/api/claim";
@@ -86,6 +92,14 @@ const MAX_ALTCHA_ATTEMPTS     = 3;
 const ALTCHA_SOLVE_TIMEOUT_MS = 45_000;
 const FAUCET_COOLDOWN_MS      = 24 * 60 * 60 * 1000;
 
+const MAX_QUIZ_ATTEMPTS        = 4;
+const MAX_SWAP_POLL_ATTEMPTS   = 15;
+const MAX_BRIDGE_POLL_ATTEMPTS = 15;
+const MAX_LEND_POLL_ATTEMPTS   = 15;
+const POLL_INTERVAL_MS         = 60_000;
+
+const PRE_SLEEP_SWEEP_WAIT_MS = 5 * 60 * 1000;
+
 const RPC_CALL_TIMEOUT_MS = 15_000;
 
 const args    = process.argv.slice(2);
@@ -99,6 +113,8 @@ const DO_SWAP     = !hasFlag("--no-swap");
 const RUN_ONCE    = hasFlag("--once");
 const RESET_HOUR  = Number.parseInt(getArg("--reset-hour", "0"), 10);
 const ONLY_ADDR   = (getArg("--only", "") || "").toLowerCase() || null;
+const SKIP_MENU   = hasFlag("--no-menu");
+const MENU_PROXY  = getArg("--proxy");
 
 const JITTER_MIN = 800;
 const JITTER_MAX = 2500;
@@ -107,6 +123,7 @@ const COOLDOWN_BETWEEN_ACCOUNTS = 30_000;
 const SKIP_ACTIONS = new Set([
   "bind_x", "x_follow", "tg_join", "discord_join", "tweet",
   "contract_deploy",
+  "swap_check", "lending_check", "bridge_check",
 ]);
 
 const C = {
@@ -146,6 +163,10 @@ const baseHeaders = (extra = {}) => ({
   ...extra,
 });
 
+let PROXY_LIST = [];
+let PROXY_INDEX = 0;
+let MENU_PROXY_VALUE = "no";
+
 function readText(file) {
   const p = path.isAbsolute(file) ? file : path.join(__dirname, file);
   if (!fs.existsSync(p)) return null;
@@ -171,6 +192,41 @@ function loadGroqKey() {
   if (!t) return "";
   const key = t.trim().split(/\s+/)[0];
   return key.startsWith("gsk_") ? key : "";
+}
+
+function normalizeProxy(line) {
+  let s = line.trim();
+  if (!s || s.startsWith("#")) return null;
+  if (!/^[a-z]+:\/\//i.test(s)) {
+    const parts = s.split(":");
+    if (parts.length === 4) s = `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+    else s = `http://${s}`;
+  }
+  return s;
+}
+
+function loadProxies() {
+  const t = readText(PROXY_FILE);
+  if (!t) return [];
+  return t.split(/\r?\n/).map(normalizeProxy).filter(Boolean);
+}
+
+function makeProxyAgent(url) {
+  if (url.startsWith("socks")) return new SocksProxyAgent(url);
+  return new HttpsProxyAgent(url);
+}
+
+function nextProxyAgent() {
+  if (PROXY_LIST.length === 0) return null;
+  const url = PROXY_LIST[PROXY_INDEX % PROXY_LIST.length];
+  PROXY_INDEX++;
+  try { return makeProxyAgent(url); }
+  catch { return null; }
+}
+
+function agentForUrl(url, useProxy) {
+  if (!useProxy) return undefined;
+  return nextProxyAgent() || undefined;
 }
 
 function loadAccounts() {
@@ -239,13 +295,15 @@ const FAUCET_COOLDOWNS = (() => {
   };
 })();
 
-async function httpJson(method, url, { headers, body } = {}) {
+async function httpJson(method, url, { headers, body, useProxy = false } = {}) {
   const res = await axios.request({
     method, url,
     headers: baseHeaders(headers),
     data: body,
     timeout: 30000,
     validateStatus: () => true,
+    httpsAgent: agentForUrl(url, useProxy),
+    proxy: false,
   });
   return { status: res.status, data: res.data };
 }
@@ -296,19 +354,38 @@ function withTimeout(promise, ms, label) {
   ]);
 }
 
-const SVP_SYSTEM_PROMPT = `You are a precise multiple-choice quiz solver for SVP Chain — a crypto L1 focused on AI-native trading.
+const SVP_SYSTEM_PROMPT = `You are a precise multiple-choice quiz solver for SVP Chain.
 
-TOPICS:
-- SVP Chain has Testnet (chainId 2517) and Mainnet (chainId 2518, rolling out).
+SVP CHAIN FACTS:
+- The smallest denomination of SVP is asvp. 1 SVP = 10^18 asvp.
+- The SVP testnet bridge from Ethereum Sepolia to SVPChain is LIVE.
+- Slinky is SVP Chain's oracle module. Missing Slinky data causes validators to produce invalid vote extensions and be jailed.
+- SVP Chain Testnet chainId is 2517. Mainnet chainId is 2518.
 - Public RPCs: svp-dataseed1-testnet.svpchain.org, svp-dataseeds-testnet.svpchain.org.
-- Explorer: explorer.svpchain.com (Blockscout fork).
-- Tooling: NovaSwap (DEX), Lendora (lending), SVP Bridge, SVP Faucet.
-- Min gas: 2 Gwei.
+- Explorer: explorer.svpchain.com.
+- Tooling: NovaSwap, Lendora, SVP Bridge, SVP Faucet.
+- Minimum gas is 2 Gwei.
 
-RULES:
-- Return ONLY a single integer: the 0-based index of the correct option.
-- Do NOT write a letter, the option text, or any explanation.
-- Do NOT add punctuation, quotes, spaces, or newlines.`;
+Do not assume that because something is true on Ethereum, it is true on SVP Chain.
+
+Return ONLY a single integer: the 0-based index of the correct option. No explanation, no punctuation, no extra text.`;
+
+const KNOWN_ANSWERS = [
+  { match: /missing Slinky causes invalid vote extensions/i, answer: 0 },
+  { match: /Testnet bridge deposit from Ethereum Sepolia to SVPChain/i, answer: 0 },
+  { match: /smallest denomination of SVP/i, answer: 1 },
+];
+
+function buildRetryHint(attempt) {
+  const base = "The previous attempt was marked incorrect by the grader.";
+  if (attempt === 2) {
+    return base + " Re-read every question and every option extremely carefully. Reconsider from scratch.";
+  }
+  if (attempt === 3) {
+    return base + " Take a completely different interpretive angle on each question. If your earlier reasoning led you to one option, seriously consider that the correct answer may be a different one.";
+  }
+  return base + " Answer as if you had never seen these questions before. Eliminate options systematically: first rule out the obviously wrong ones, then examine the remaining options against the exact wording of the question. Pay special attention to subtle qualifiers.";
+}
 
 class QuizSolver {
   constructor(apiKey) {
@@ -318,37 +395,52 @@ class QuizSolver {
   }
   isEnabled() { return this.enabled; }
 
-  _buildPrompt(q) {
-    const opts = (q.options || []).map((label, i) => `  [${i}] ${label}`).join("\n");
+  _buildPrompt(q, displayOptions) {
+    const opts = displayOptions.map((o, i) => `  [${i}] ${o.text}`).join("\n");
     return `Question:\n${q.question}\n\nOptions:\n${opts}\n\nReturn the 0-based index:`;
   }
 
   _extractIndex(text, maxIndex) {
     if (text == null) return null;
-    const cleaned = String(text).trim().toLowerCase();
-    const strict = cleaned.match(/^(\d+)\b/);
+    const cleaned = String(text).trim();
+
+    const strict = cleaned.match(/^(\d+)\s*$/);
     if (strict) {
       const n = Number.parseInt(strict[1], 10);
       if (Number.isInteger(n) && n >= 0 && n <= maxIndex) return n;
     }
-    for (const ch of cleaned) {
-      if (ch >= "0" && ch <= "9") {
-        const n = Number.parseInt(ch, 10);
-        if (n >= 0 && n <= maxIndex) return n;
+
+    const lines = cleaned.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (lines.length > 0) {
+      const lastLine = lines[lines.length - 1];
+      const m = lastLine.match(/^(\d+)\b/);
+      if (m) {
+        const n = Number.parseInt(m[1], 10);
+        if (Number.isInteger(n) && n >= 0 && n <= maxIndex) return n;
       }
     }
+
+    const digits = [...cleaned.matchAll(/\b(\d+)\b/g)]
+      .map(m => Number.parseInt(m[1], 10))
+      .filter(n => n >= 0 && n <= maxIndex);
+    if (digits.length >= 1) return digits[digits.length - 1];
+
     return null;
   }
 
-  async _callGroq(model, prompt) {
+  async _callGroq(model, prompt, { temperature = 0, extraSystem = "" } = {}) {
+    const system = extraSystem
+      ? `${SVP_SYSTEM_PROMPT}\n\nADDITIONAL INSTRUCTION:\n${extraSystem}`
+      : SVP_SYSTEM_PROMPT;
+
     const res = await axios.post(GROQ_URL, {
       model,
       messages: [
-        { role: "system", content: SVP_SYSTEM_PROMPT },
+        { role: "system", content: system },
         { role: "user", content: prompt },
       ],
       max_tokens: 512,
-      temperature: 0,
+      temperature,
       stream: false,
     }, {
       timeout: 20000,
@@ -358,29 +450,50 @@ class QuizSolver {
         "User-Agent": randUA(),
       },
       validateStatus: () => true,
+      httpsAgent: agentForUrl(GROQ_URL, MENU_PROXY_VALUE === "yes"),
+      proxy: false,
     });
     if (res.status >= 400) throw new Error(`Groq HTTP ${res.status}`);
     const msg = res.data?.choices?.[0]?.message || {};
     return msg.content || msg.reasoning || "";
   }
 
-  async solve(q) {
+  async solve(q, opts = {}) {
     if (!this.enabled) return null;
     if (!q?.question || !Array.isArray(q.options) || q.options.length === 0) return null;
     const maxIndex = q.options.length - 1;
-    const key = `${q.id}::${q.question}`;
-    if (this.cache.has(key)) return this.cache.get(key);
 
-    const prompt = this._buildPrompt(q);
+    for (const k of KNOWN_ANSWERS) {
+      if (k.match.test(q.question) && k.answer >= 0 && k.answer <= maxIndex) {
+        log(`   ${C.green}🧠 known answer for "${q.question.slice(0, 50)}…" → ${k.answer}${C.reset}`);
+        return k.answer;
+      }
+    }
+
+    let displayOptions = q.options.map((text, i) => ({ text, originalIndex: i }));
+    if (opts.shuffleOptions) {
+      for (let i = displayOptions.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [displayOptions[i], displayOptions[j]] = [displayOptions[j], displayOptions[i]];
+      }
+    }
+
+    const tag = `${opts.temperature ?? 0}|${opts.shuffleOptions ? 1 : 0}`;
+    const key = `${tag}::${q.id}::${q.question}`;
+    if (!opts.cacheBust && this.cache.has(key)) return this.cache.get(key);
+
+    const prompt = this._buildPrompt(q, displayOptions);
     for (const model of [GROQ_MODEL, GROQ_FALLBACK]) {
       if (!model) continue;
       try {
-        const raw = await this._callGroq(model, prompt);
-        const idx = this._extractIndex(raw, maxIndex);
-        if (idx !== null) {
-          this.cache.set(key, idx);
-          log(`   ${C.cyan}🤖 Groq [${model}] → idx=${idx}${C.reset}`);
-          return idx;
+        const raw = await this._callGroq(model, prompt, opts);
+        const displayIdx = this._extractIndex(raw, maxIndex);
+        if (displayIdx !== null) {
+          const originalIdx = displayOptions[displayIdx].originalIndex;
+          this.cache.set(key, originalIdx);
+          const tag2 = (opts.temperature ?? 0) > 0 ? ` t=${opts.temperature.toFixed(2)}` : "";
+          log(`   ${C.cyan}🤖 Groq [${model}${tag2}] → idx=${originalIdx}${C.reset}`);
+          return originalIdx;
         }
       } catch (e) {
         log(`   ${C.yellow}🤖 Groq [${model}] failed: ${e.message}${C.reset}`);
@@ -389,10 +502,10 @@ class QuizSolver {
     return null;
   }
 
-  async solveAll(questions) {
+  async solveAll(questions, opts = {}) {
     const answers = [];
     for (const q of questions) {
-      const idx = await this.solve(q);
+      const idx = await this.solve(q, opts);
       if (idx === null) return null;
       answers.push({ id: q.id, choice: idx });
     }
@@ -423,7 +536,7 @@ class SvpClient {
     const { status, data } = await httpJson(
       method,
       `${API_BASE}${pathname}`,
-      { headers, body: body !== undefined ? JSON.stringify(body) : undefined }
+      { headers, body: body !== undefined ? JSON.stringify(body) : undefined, useProxy: MENU_PROXY_VALUE === "yes" }
     );
 
     if (!data || typeof data !== "object") throw new ApiError(-1, `HTTP ${status}`, status);
@@ -458,6 +571,7 @@ async function fetchAltchaEnvelope(address, tokenAddress) {
       "referer": "https://www.svpchain.org/faucet",
       "origin": "https://www.svpchain.org",
     },
+    useProxy: MENU_PROXY_VALUE === "yes",
   });
   if (status !== 200 || !data?.parameters) throw new Error(`challenge HTTP ${status}`);
   return data;
@@ -467,7 +581,7 @@ async function solveAltcha(envelope) {
   const start = Date.now();
   const solution = await solveChallenge({
     challenge: envelope,
-    deriveKey: pbkdf2.deriveKey,
+    deriveKey: pbkdf2DeriveKey,
     timeout: ALTCHA_SOLVE_TIMEOUT_MS,
   });
   if (!solution || typeof solution.counter !== "number") {
@@ -519,6 +633,7 @@ async function faucetClaimOne(address, tokenAddress, symbol) {
         address,
         altcha: altchaToken,
       }),
+      useProxy: MENU_PROXY_VALUE === "yes",
     });
     status = r.status; data = r.data;
   } catch (e) {
@@ -550,11 +665,6 @@ async function faucetClaimWithRetry(address, token, attempts = MAX_CLAIM_ATTEMPT
   return { ok: false, symbol: token.symbol, errMsg: "max retries exceeded" };
 }
 
-/**
- * Recover a real faucet drip tx from the explorer.
- * Faucet wallet is 0x8b52753dcbad46925821f02b7b7d90bad8804bfe — every drip
- * comes from it. ERC-20 drips (USDC/USDV/WBTC/WBNB) appear in tokentx.
- */
 async function findRecentFaucetTx(address) {
   const FAUCET_WALLET = "0x8b52753dcbad46925821f02b7b7d90bad8804bfe";
   try {
@@ -563,6 +673,7 @@ async function findRecentFaucetTx(address) {
                 `&sort=desc&page=1&offset=50`;
     const { status, data } = await httpJson("GET", url, {
       headers: { accept: "application/json" },
+      useProxy: MENU_PROXY_VALUE === "yes",
     });
     if (status !== 200) return null;
     const items = data?.result;
@@ -941,11 +1052,50 @@ async function handleQuiz(client, task, solver) {
   if (!questions.length) { log(`   🧠 quiz: no questions`); return; }
   if (!solver.isEnabled()) { log(`   🧠 quiz: Groq disabled`); return; }
 
-  const answers = await solver.solveAll(questions);
-  if (!answers) { log(`   🧠 quiz: solver failed`); return; }
+  let lastSig = null;
 
-  const res = await client.claimTask(task.id, { answers });
-  log(`   ${C.green}🧠 quiz +${res.pointsAwarded} pts${C.reset}`);
+  for (let attempt = 1; attempt <= MAX_QUIZ_ATTEMPTS; attempt++) {
+    const isRetry = attempt > 1;
+    const opts = isRetry
+      ? {
+          temperature: 0.4 + (attempt - 2) * 0.15,
+          extraSystem: buildRetryHint(attempt),
+          shuffleOptions: true,
+          cacheBust: true,
+        }
+      : { temperature: 0 };
+
+    const answers = await solver.solveAll(questions, opts);
+    if (!answers) {
+      log(`   ${C.yellow}🧠 quiz: solver returned no answers on attempt ${attempt}${C.reset}`);
+      return;
+    }
+
+    const sig = answers.map(a => a.choice).join(",");
+    if (isRetry && sig === lastSig) {
+      log(`   ${C.yellow}🧠 quiz: model repeated the same answers — forcing new sample${C.reset}`);
+      continue;
+    }
+    lastSig = sig;
+
+    try {
+      const res = await client.claimTask(task.id, { answers });
+      log(`   ${C.green}🧠 quiz +${res.pointsAwarded} pts${C.reset}` + (attempt > 1 ? ` (attempt ${attempt})` : ""));
+      return;
+    } catch (e) {
+      const msg = e.message || "";
+      const isRetryable = /incorrect|try again|wrong/i.test(msg);
+      if (isRetryable && attempt < MAX_QUIZ_ATTEMPTS) {
+        log(`   ${C.yellow}🧠 quiz attempt ${attempt}/${MAX_QUIZ_ATTEMPTS} rejected — retrying with fresh answers${C.reset}`);
+        await sleep(3000);
+        continue;
+      }
+      log(`   ${C.red}🧠 quiz error: ${msg}${C.reset}`);
+      return;
+    }
+  }
+
+  log(`   ${C.red}🧠 quiz: gave up after ${MAX_QUIZ_ATTEMPTS} attempts${C.reset}`);
 }
 
 async function handleFaucet(client, task, address) {
@@ -999,7 +1149,7 @@ async function handleFaucet(client, task, address) {
 }
 
 async function handleVerifyThenClaim(client, task) {
-  if (task.userStatus === "done") return;
+  if (task.userStatus === "done") return true;
 
   if (task.userStatus === "todo") {
     try { await client.startTask(task.id); } catch {}
@@ -1007,7 +1157,12 @@ async function handleVerifyThenClaim(client, task) {
 
   let upd;
   try { upd = await client.verifyTask(task.id); }
-  catch (e) { log(`   ${C.yellow}🔍 verify: ${e.message}${C.reset}`); return; }
+  catch (e) {
+    if (!/PRODUCT_BUSY|PRODUCT_TASK_NOT_SUPPORTED/i.test(e.message)) {
+      log(`   ${C.yellow}🔍 verify: ${e.message}${C.reset}`);
+    }
+    return false;
+  }
 
   const ps = upd?.productState;
   log(`   🔍 verify ${task.title} → ${upd.userStatus}` +
@@ -1020,19 +1175,47 @@ async function handleVerifyThenClaim(client, task) {
             `)` : ""));
 
   if (upd.userStatus === "claimable") {
+    try {
+      const r = await client.claimTask(task.id, {});
+      log(`   ${C.green}✅ claim ${task.title} +${r.pointsAwarded}${C.reset}`);
+      return true;
+    } catch (e) {
+      log(`   ${C.yellow}claim ${task.title}: ${e.message}${C.reset}`);
+      return false;
+    }
+  }
+  return false;
+}
+
+async function handleOnchainTxCount(client, task) {
+  if (task.userStatus === "done") return true;
+  if (task.userStatus === "todo") {
+    try { await client.startTask(task.id); } catch {}
+  }
+  try {
     const r = await client.claimTask(task.id, {});
     log(`   ${C.green}✅ claim ${task.title} +${r.pointsAwarded}${C.reset}`);
+    return true;
+  } catch (e) {
+    if (/not completed|not ready|threshold|not supported/i.test(e.message)) {
+      log(`   ${C.dim}⏭️  ${task.title}: on-chain count not met yet${C.reset}`);
+    } else {
+      log(`   ${C.yellow}${task.title}: ${e.message}${C.reset}`);
+    }
+    return false;
   }
 }
 
 async function handleGeneric(client, task) {
-  if (task.userStatus === "done") return;
+  if (task.userStatus === "done") return true;
   if (task.userStatus === "todo") {
     await client.startTask(task.id).catch(() => {});
   } else if (task.userStatus === "claimable") {
     const r = await client.claimTask(task.id, {});
     log(`   ${C.green}✅ claim ${task.title} +${r.pointsAwarded}${C.reset}`);
+    return true;
   }
+  return false;
 }
 
 async function claimAllRegionChests(client) {
@@ -1052,7 +1235,7 @@ async function claimAllRegionChests(client) {
 async function handleSwapTask(client, task, address, privateKey, provider) {
   if (task.userStatus === "done") {
     log(`\n${C.cyan}🔄 ─── swap_check already done ───${C.reset}`);
-    return;
+    return true;
   }
 
   const progress = task.productState?.progress ?? 0;
@@ -1060,14 +1243,12 @@ async function handleSwapTask(client, task, address, privateKey, provider) {
 
   if (progress >= target) {
     log(`\n${C.cyan}🔄 ─── swap_check at ${progress}/${target} — verifying ───${C.reset}`);
-    await handleVerifyThenClaim(client, task);
-    return;
+    return await handleVerifyThenClaim(client, task);
   }
 
   if (!DO_SWAP) {
     log(`\n${C.cyan}🔄 ─── swap disabled (--no-swap) — verifying only ───${C.reset}`);
-    await handleVerifyThenClaim(client, task);
-    return;
+    return await handleVerifyThenClaim(client, task);
   }
 
   log(`\n${C.bold}${C.cyan}🔄 ─── swap_check: executing 3 swap legs ───${C.reset}`);
@@ -1077,20 +1258,21 @@ async function handleSwapTask(client, task, address, privateKey, provider) {
 
   if (hashes.length === 0) {
     log(`   ${C.yellow}😕 no swaps landed — verifying anyway${C.reset}`);
-    await handleVerifyThenClaim(client, task);
-    return;
+    return await handleVerifyThenClaim(client, task);
   }
 
   TXHASHES.set(address, "swap_last", hashes.join(","));
-
   log(`   ${C.green}⏳ swaps landed — waiting 90s for indexer…${C.reset}`);
   await sleep(90_000);
 
-  const MAX_ATTEMPTS = 6;
-  for (let i = 1; i <= MAX_ATTEMPTS; i++) {
+  for (let i = 1; i <= MAX_SWAP_POLL_ATTEMPTS; i++) {
     let upd;
     try { upd = await client.verifyTask(task.id); }
-    catch (e) { log(`   ${C.yellow}🔍 verify ${i}/${MAX_ATTEMPTS}: ${e.message}${C.reset}`); }
+    catch (e) {
+      if (!/PRODUCT_BUSY/i.test(e.message)) {
+        log(`   ${C.yellow}🔍 verify ${i}/${MAX_SWAP_POLL_ATTEMPTS}: ${e.message}${C.reset}`);
+      }
+    }
 
     if (upd) {
       const ps = upd.productState;
@@ -1102,20 +1284,81 @@ async function handleSwapTask(client, task, address, privateKey, provider) {
       if (upd.userStatus === "claimable") {
         const r = await client.claimTask(task.id, {});
         log(`   ${C.green}✅ claim ${task.title} +${r.pointsAwarded}${C.reset}`);
-        return;
+        return true;
       }
-      if (upd.userStatus === "done") return;
+      if (upd.userStatus === "done") return true;
     }
-    if (i < MAX_ATTEMPTS) await sleep(20_000);
+    if (i < MAX_SWAP_POLL_ATTEMPTS) await sleep(POLL_INTERVAL_MS);
   }
 
   log(`   ${C.yellow}😕 swap_check still not claimable after retries${C.reset}`);
+  return false;
+}
+
+async function handleLendoraTask(client, task, privateKey, provider) {
+  if (task.userStatus === "done") {
+    log(`\n${C.cyan}🏦 ─── Lendora already done ───${C.reset}`);
+    return true;
+  }
+
+  const progress = task.productState?.progress ?? 0;
+  const target = task.productState?.target ?? 1;
+
+  if (progress < target && DO_LEND) {
+    log(`\n${C.bold}${C.green}🏦 ─── Step 5: Lendora supply ───${C.reset}`);
+    let hash = null;
+    try { hash = await performLendoraSupply(privateKey, provider); }
+    catch (e) { log(`   ${C.red}🏦 lendora error: ${e.message}${C.reset}`); }
+
+    if (hash) {
+      log(`   ${C.green}⏳ supply landed — waiting 20s for indexer…${C.reset}`);
+      await sleep(20_000);
+    }
+  } else if (progress >= target) {
+    log(`\n${C.cyan}🏦 ─── Lendora at ${progress}/${target} — verifying ───${C.reset}`);
+  } else {
+    log(`\n${C.cyan}🏦 ─── Lendora disabled (--no-lend) ───${C.reset}`);
+  }
+
+  for (let i = 1; i <= MAX_LEND_POLL_ATTEMPTS; i++) {
+    let upd;
+    try { upd = await client.verifyTask(task.id); }
+    catch (e) {
+      if (!/PRODUCT_BUSY|PRODUCT_TASK_NOT_SUPPORTED/i.test(e.message)) {
+        log(`   ${C.yellow}🔍 verify lendora ${i}/${MAX_LEND_POLL_ATTEMPTS}: ${e.message}${C.reset}`);
+      }
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+
+    const ps = upd?.productState;
+    log(`   🔍 verify ${task.title} → ${upd.userStatus}` +
+        (ps ? ` (${ps.progress ?? "?"}/${ps.target ?? "?"}` +
+              (ps.reasonCode ? `, reason=${ps.reasonCode}` : "") + `)` : ""));
+
+    if (upd.userStatus === "claimable") {
+      try {
+        const r = await client.claimTask(task.id, {});
+        log(`   ${C.green}✅ claim ${task.title} +${r.pointsAwarded}${C.reset}`);
+        return true;
+      } catch (e) {
+        log(`   ${C.yellow}🏦 claim failed: ${e.message}${C.reset}`);
+      }
+    } else if (upd.userStatus === "done") {
+      return true;
+    }
+
+    if (i < MAX_LEND_POLL_ATTEMPTS) await sleep(POLL_INTERVAL_MS);
+  }
+
+  log(`   ${C.yellow}😕 lending_check still not claimable after ${MAX_LEND_POLL_ATTEMPTS} attempts${C.reset}`);
+  return false;
 }
 
 async function handleBridgeTask(client, task, address, privateKey, provider) {
   if (task.userStatus === "done") {
     log(`\n${C.cyan}🌉 ─── bridge_check already done ───${C.reset}`);
-    return;
+    return true;
   }
 
   const progress = task.productState?.progress ?? 0;
@@ -1124,41 +1367,41 @@ async function handleBridgeTask(client, task, address, privateKey, provider) {
 
   if (progress >= target) {
     log(`\n${C.cyan}🌉 ─── bridge progress ${progress}/${target} — verifying ───${C.reset}`);
-    await handleVerifyThenClaim(client, task);
-    return;
+    return await handleVerifyThenClaim(client, task);
   }
 
   if (processing > 0) {
     log(`\n${C.cyan}🌉 ─── bridge already processing (${processing}) — verifying ───${C.reset}`);
-    await handleVerifyThenClaim(client, task);
-    return;
+    return await handleVerifyThenClaim(client, task);
   }
 
   if (!DO_BRIDGE) {
     log(`\n${C.cyan}🌉 ─── bridge disabled (--no-bridge) ───${C.reset}`);
-    return;
+    return false;
   }
 
   log(`\n${C.bold}${C.blue}🌉 ─── Executing bridge SVP → Arbitrum Sepolia ───${C.reset}`);
   let hash;
   try { hash = await performBridge(privateKey, provider); }
-  catch (e) { log(`   ${C.red}🌉 bridge error: ${e.message}${C.reset}`); return; }
+  catch (e) { log(`   ${C.red}🌉 bridge error: ${e.message}${C.reset}`); return false; }
 
   if (!hash) {
     log(`   ${C.yellow}😕 no bridge tx sent — trying verify anyway${C.reset}`);
-    await handleVerifyThenClaim(client, task);
-    return;
+    return await handleVerifyThenClaim(client, task);
   }
 
   TXHASHES.set(address, "bridge_last", hash);
   log(`   ${C.green}⏳ waiting ${BRIDGE_VERIFY_WAIT_MS / 1000}s for indexer…${C.reset}`);
   await sleep(BRIDGE_VERIFY_WAIT_MS);
 
-  const MAX_ATTEMPTS = 6;
-  for (let i = 1; i <= MAX_ATTEMPTS; i++) {
+  for (let i = 1; i <= MAX_BRIDGE_POLL_ATTEMPTS; i++) {
     let upd;
     try { upd = await client.verifyTask(task.id); }
-    catch (e) { log(`   ${C.yellow}🔍 verify ${i}/${MAX_ATTEMPTS}: ${e.message}${C.reset}`); }
+    catch (e) {
+      if (!/PRODUCT_BUSY/i.test(e.message)) {
+        log(`   ${C.yellow}🔍 verify ${i}/${MAX_BRIDGE_POLL_ATTEMPTS}: ${e.message}${C.reset}`);
+      }
+    }
 
     if (upd) {
       const ps = upd.productState;
@@ -1173,14 +1416,15 @@ async function handleBridgeTask(client, task, address, privateKey, provider) {
       if (upd.userStatus === "claimable") {
         const r = await client.claimTask(task.id, {});
         log(`   ${C.green}✅ claim ${task.title} +${r.pointsAwarded}${C.reset}`);
-        return;
+        return true;
       }
-      if (upd.userStatus === "done") return;
+      if (upd.userStatus === "done") return true;
     }
-    if (i < MAX_ATTEMPTS) await sleep(20_000);
+    if (i < MAX_BRIDGE_POLL_ATTEMPTS) await sleep(POLL_INTERVAL_MS);
   }
 
   log(`   ${C.yellow}😕 bridge_check still not claimable after retries${C.reset}`);
+  return false;
 }
 
 async function runAccount(account, idx, total, ctx) {
@@ -1195,11 +1439,6 @@ async function runAccount(account, idx, total, ctx) {
   const { client, address } = conn;
   log(`📍 Address: ${address}`);
 
-  // ─── Start-of-cycle safety net: if all local faucet cooldowns have
-  // expired, the previous run's faucet hashes have been consumed by the
-  // backend and are no longer valid proof. Clear them so the next drip
-  // writes fresh ones. (Normally runCycle's end-of-cycle cleanup already
-  // did this — this catches crash-before-cleanup cases.)
   const anyFresh = FAUCET_TOKENS.some(t => FAUCET_COOLDOWNS.isFresh(address, t.address));
   if (!anyFresh) {
     const n = TXHASHES.clearFaucetKeys(address);
@@ -1224,8 +1463,10 @@ async function runAccount(account, idx, total, ctx) {
     return;
   }
 
-  // ─── Step 1: Faucet (gates everything else) ──────────────────────
-  const faucetTask = tasks.find(t => t.actionType === "faucet_claim");
+  const getTask = (type) => tasks.find(t => t.actionType === type);
+  const isDone = (t) => !t || t.userStatus === "done";
+
+  const faucetTask = getTask("faucet_claim");
   if (faucetTask && faucetTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}💧 ─── Step 1: Faucet ───${C.reset}`);
     let faucetOk = false;
@@ -1239,8 +1480,8 @@ async function runAccount(account, idx, total, ctx) {
     }
 
     if (!faucetOk) {
-      log(`\n${C.yellow}⚠️  Faucet task is not claimable — check-in / quiz / swap / lend / bridge are all LOCKED behind it.${C.reset}`);
-      log(`${C.yellow}⚠️  Skipping the rest of the daily chain for this account. Re-run once faucet claim goes through.${C.reset}`);
+      log(`\n${C.yellow}⚠️  Faucet task is not claimable — everything behind it is LOCKED.${C.reset}`);
+      log(`${C.yellow}⚠️  Skipping the rest of the daily chain for this account.${C.reset}`);
       return;
     }
 
@@ -1249,42 +1490,49 @@ async function runAccount(account, idx, total, ctx) {
     log(`\n${C.cyan}💧 ─── Step 1: Faucet skipped (done) ───${C.reset}`);
   }
 
-  // ─── Step 2: Check-in ─────────────────────────────────────────────
-  const checkinTask = tasks.find(t => t.actionType === "checkin");
+  const checkinTask = getTask("checkin");
   if (checkinTask && checkinTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}📅 ─── Step 2: Check-in ───${C.reset}`);
     try { await handleCheckin(client, checkinTask); }
     catch (e) { log(`   ${C.red}📅 checkin error: ${e.message}${C.reset}`); }
     try { tasks = flattenTasks(await client.tasks()); } catch {}
+    if (!isDone(getTask("checkin"))) {
+      log(`\n${C.yellow}⚠️  Check-in not complete — skipping quiz/swap/lend/bridge.${C.reset}`);
+      return;
+    }
   } else if (checkinTask) {
     log(`\n${C.cyan}📅 ─── Step 2: Check-in skipped (done) ───${C.reset}`);
   }
 
-  // ─── Step 3: Quiz ─────────────────────────────────────────────────
-  const quizTask = tasks.find(t => t.actionType === "quiz");
+  const quizTask = getTask("quiz");
   if (quizTask && quizTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}🧠 ─── Step 3: Quiz ───${C.reset}`);
     try { await handleQuiz(client, quizTask, solver); }
     catch (e) { log(`   ${C.red}🧠 quiz error: ${e.message}${C.reset}`); }
     try { tasks = flattenTasks(await client.tasks()); } catch {}
+    if (!isDone(getTask("quiz"))) {
+      log(`\n${C.yellow}⚠️  Quiz not complete — skipping swap/lend/bridge.${C.reset}`);
+      return;
+    }
   } else if (quizTask) {
     log(`\n${C.cyan}🧠 ─── Step 3: Quiz skipped (done) ───${C.reset}`);
   }
 
-  // ─── Step 4: Swap ─────────────────────────────────────────────────
-  const swapTask = tasks.find(t => t.actionType === "swap_check");
+  const swapTask = getTask("swap_check");
   if (swapTask && swapTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}🔄 ─── Step 4: Auto-Swap ───${C.reset}`);
-    log(`→ [${swapTask.category}] ${swapTask.title} (${swapTask.actionType}, ${swapTask.userStatus})`);
     try { await handleSwapTask(client, swapTask, address, account.privateKey, provider); }
     catch (e) { log(`   ${C.red}🔄 swap error: ${e.message}${C.reset}`); }
     try { tasks = flattenTasks(await client.tasks()); } catch {}
+    if (!isDone(getTask("swap_check"))) {
+      log(`\n${C.yellow}⚠️  Swap not complete — skipping lend/bridge.${C.reset}`);
+      return;
+    }
   } else if (swapTask) {
     log(`\n${C.cyan}🔄 ─── Step 4: Auto-Swap skipped (done) ───${C.reset}`);
   }
 
-  // ─── Step 5: Lendora ──────────────────────────────────────────────
-  const lendTask = tasks.find(t => t.actionType === "lending_check");
+  const lendTask = getTask("lending_check");
   if (!DO_LEND) {
     log(`\n${C.cyan}🏦 ─── Step 5: Lendora disabled ───${C.reset}`);
   } else if (!lendTask) {
@@ -1292,21 +1540,17 @@ async function runAccount(account, idx, total, ctx) {
   } else if (lendTask.userStatus === "done") {
     log(`\n${C.cyan}🏦 ─── Step 5: Lendora skipped (done) ───${C.reset}`);
   } else {
-    const progress = lendTask.productState?.progress ?? 0;
-    const target = lendTask.productState?.target ?? 1;
-    if (progress < target) {
-      log(`\n${C.bold}${C.green}🏦 ─── Step 5: Lendora supply ───${C.reset}`);
-      try {
-        const hash = await performLendoraSupply(account.privateKey, provider);
-        if (hash) { await sleep(15000); try { tasks = flattenTasks(await client.tasks()); } catch {} }
-      } catch (e) { log(`   ${C.red}🏦 lendora error: ${e.message}${C.reset}`); }
-    } else {
-      log(`\n${C.cyan}🏦 ─── Step 5: lending_check at ${progress}/${target} ───${C.reset}`);
+    let lendOk = false;
+    try { lendOk = await handleLendoraTask(client, lendTask, account.privateKey, provider); }
+    catch (e) { log(`   ${C.red}🏦 lendora error: ${e.message}${C.reset}`); }
+    try { tasks = flattenTasks(await client.tasks()); } catch {}
+    if (!lendOk && !isDone(getTask("lending_check"))) {
+      log(`\n${C.yellow}⚠️  Lendora not complete — skipping bridge.${C.reset}`);
+      return;
     }
   }
 
-  // ─── Step 6: Bridge ───────────────────────────────────────────────
-  const bridgeTask = tasks.find(t => t.actionType === "bridge_check");
+  const bridgeTask = getTask("bridge_check");
   if (bridgeTask && bridgeTask.userStatus !== "done") {
     log(`\n${C.bold}${C.green}🌉 ─── Step 6: Bridge ───${C.reset}`);
     await handleBridgeTask(client, bridgeTask, address, account.privateKey, provider);
@@ -1315,7 +1559,6 @@ async function runAccount(account, idx, total, ctx) {
     log(`\n${C.cyan}🌉 ─── Step 6: Bridge skipped (done) ───${C.reset}`);
   }
 
-  // ─── Step 7: Remaining tasks ──────────────────────────────────────
   log(`\n${C.bold}${C.green}📋 ─── Step 7: Remaining tasks ───${C.reset}`);
   let didAnything = false;
   for (const t of tasks) {
@@ -1328,11 +1571,8 @@ async function runAccount(account, idx, total, ctx) {
 
     try {
       switch (t.actionType) {
-        case "swap_check":
-        case "lending_check":
-        case "bridge_check":
         case "onchain_tx_count":
-          await handleVerifyThenClaim(client, t);
+          await handleOnchainTxCount(client, t);
           break;
         default:
           await handleGeneric(client, t);
@@ -1343,7 +1583,6 @@ async function runAccount(account, idx, total, ctx) {
   }
   if (!didAnything) log(`   ${C.dim}(nothing left)${C.reset}`);
 
-  // ─── Step 8: Region chests ────────────────────────────────────────
   log(`\n${C.bold}${C.green}🎁 ─── Step 8: Region chests ───${C.reset}`);
   await claimAllRegionChests(client);
 }
@@ -1376,6 +1615,55 @@ async function sleepUntilNextRun() {
   }
 }
 
+async function preSleepSweep(ctx) {
+  const { accounts } = ctx;
+  if (accounts.length === 0) return;
+
+  log(`\n${C.cyan}🔁 Pre-sleep sweep — waiting ${PRE_SLEEP_SWEEP_WAIT_MS / 60000} min for slow indexers…${C.reset}`);
+  await sleep(PRE_SLEEP_SWEEP_WAIT_MS);
+
+  for (const account of accounts) {
+    let conn;
+    try { conn = await loginAccount(account.privateKey); }
+    catch (e) { log(`   ${C.red}sweep login fail ${account.label}: ${e.message}${C.reset}`); continue; }
+    const { client } = conn;
+
+    let tasks = [];
+    try { tasks = flattenTasks(await client.tasks()); }
+    catch { continue; }
+
+    let changed = false;
+    for (const t of tasks) {
+      if (t.userStatus === "done") continue;
+      if (!["bridge_check", "swap_check", "lending_check", "onchain_tx_count"].includes(t.actionType)) continue;
+
+      try {
+        const upd = await client.verifyTask(t.id);
+        const ps = upd?.productState;
+        log(`   🔍 sweep ${t.actionType} → ${upd.userStatus}` +
+            (ps ? ` (${ps.progress ?? "?"}/${ps.target ?? "?"}` +
+                  (ps.reasonCode ? `, reason=${ps.reasonCode}` : "") +
+                  (ps.bridgeSummary ? `, bridge processing=${ps.bridgeSummary.processingCount ?? 0}` : "") +
+                  `)` : ""));
+        if (upd.userStatus === "claimable") {
+          const r = await client.claimTask(t.id, {});
+          log(`   ${C.green}✅ sweep claimed ${t.title} +${r.pointsAwarded}${C.reset}`);
+          changed = true;
+        }
+      } catch (e) {
+        if (!/PRODUCT_BUSY|PRODUCT_TASK_NOT_SUPPORTED/i.test(e.message)) {
+          log(`   ${C.yellow}sweep ${t.actionType}: ${e.message}${C.reset}`);
+        }
+      }
+      await sleep(3000);
+    }
+
+    if (changed) {
+      try { await claimAllRegionChests(client); } catch {}
+    }
+  }
+}
+
 async function runCycle(ctx, cycleNum) {
   log(`\n${C.bold}${C.cyan}🔄 ═══════════ CYCLE #${cycleNum} — ${new Date().toISOString()} ═══════════${C.reset}`);
   const { accounts } = ctx;
@@ -1388,11 +1676,6 @@ async function runCycle(ctx, cycleNum) {
     }
   }
 
-  // ─── End-of-cycle cleanup ─────────────────────────────────────────
-  // Every task for today is done; we're about to sleep for ~24h. Drop
-  // cached faucet hashes so tomorrow's fresh drip writes new ones.
-  // swap_last / bridge_last / anything else is kept — harmless and
-  // useful for late re-verification.
   log(`\n${C.dim}🧹 End-of-cycle cleanup — clearing faucet hashes for next run…${C.reset}`);
   for (const acc of accounts) {
     const n = TXHASHES.clearFaucetKeys(acc.address);
@@ -1421,12 +1704,52 @@ function buildProvider() {
   return new ethers.FallbackProvider(configs, CHAIN_ID, { quorum: 1 });
 }
 
+async function showMenu() {
+  const rl = readline.createInterface({ input, output });
+  console.log("");
+  console.log(`${C.cyan}${C.bold}════════════════════════════════════════${C.reset}`);
+  console.log(`${C.cyan}${C.bold}  SVP Rewards — connection mode${C.reset}`);
+  console.log(`${C.cyan}${C.bold}════════════════════════════════════════${C.reset}`);
+  console.log(`  ${C.green}[1]${C.reset} Direct connection (no proxy)`);
+  console.log(`  ${C.green}[2]${C.reset} Proxy mode (load from ${PROXY_FILE})`);
+  console.log("");
+  let answer = "";
+  while (!["1", "2"].includes(answer)) {
+    answer = (await rl.question(`  Choose [1/2]: `)).trim();
+  }
+  rl.close();
+  console.log("");
+  return answer;
+}
+
 async function main() {
-  log(`${C.cyan}${C.bold}🌟 SVP Rewards — daily auto-farmer (v4.7)${C.reset}`);
+  if (!SKIP_MENU && !MENU_PROXY) {
+    const choice = await showMenu();
+    if (choice === "2") {
+      PROXY_LIST = loadProxies();
+      if (PROXY_LIST.length === 0) {
+        console.log(`${C.red}No proxies found in ${PROXY_FILE}. Falling back to direct.${C.reset}`);
+        MENU_PROXY_VALUE = "no";
+      } else {
+        MENU_PROXY_VALUE = "yes";
+        console.log(`${C.green}Loaded ${PROXY_LIST.length} proxy(ies) from ${PROXY_FILE}${C.reset}`);
+      }
+    } else {
+      MENU_PROXY_VALUE = "no";
+    }
+  } else if (MENU_PROXY === "yes") {
+    PROXY_LIST = loadProxies();
+    MENU_PROXY_VALUE = PROXY_LIST.length > 0 ? "yes" : "no";
+  } else {
+    MENU_PROXY_VALUE = "no";
+  }
+
+  log(`${C.cyan}${C.bold}🌟 SVP Rewards — daily auto-farmer (v5.3)${C.reset}`);
   log(`⛓️  Chain ID  : ${CHAIN_ID}`);
   log(`🌐 RPCs      : ${RPC_URLS.join(", ")}`);
   log(`🔀 Router    : ${ROUTER_ADDRESS}`);
   log(`🌉 Bridge    : ${BRIDGE_CONTRACT}`);
+  log(`🌐 Network   : ${MENU_PROXY_VALUE === "yes" ? `PROXY (${PROXY_LIST.length} loaded)` : "DIRECT"}`);
   log(`🧪 Dry run   : ${DRY_RUN ? "YES" : "no"}`);
   log(`🔄 Run mode  : ${RUN_ONCE ? "ONCE" : "LOOP (daily)"}`);
   log(`⏰ Reset UTC : ${RESET_HOUR}:00`);
@@ -1471,6 +1794,8 @@ async function main() {
   while (true) {
     try { await runCycle(ctx, cycle); cycle++; }
     catch (e) { log(`${C.red}💥 Cycle crashed: ${e.message}${C.reset}`); }
+    try { await preSleepSweep(ctx); }
+    catch (e) { log(`${C.red}sweep crashed: ${e.message}${C.reset}`); }
     await sleepUntilNextRun();
   }
 }

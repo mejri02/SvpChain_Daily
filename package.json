@@ -1,21 +1,23 @@
 {
-  "name": "svp-all-in-one",
-  "version": "1.0.0",
+  "name": "svp-rewards-farmer",
+  "version": "5.3.0",
+  "description": "SVP Rewards daily auto-farmer",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "once": "node index.js --once",
     "dry": "node index.js --dry"
   },
-  "dependencies": {
-    "altcha": "^3.2.3",
-    "axios": "^1.7.0",
-    "dotenv": "^18.0.4",
-    "ethers": "^6.17.0",
-    "viem": "^2.21.0"
+  "engines": {
+    "node": ">=18.17.0"
   },
-  "description": "",
-  "main": "index.js",
-  "keywords": [],
-  "author": "",
-  "license": "ISC"
+  "dependencies": {
+    "altcha-lib": "^2.5.0",
+    "axios": "^1.7.7",
+    "ethers": "^6.13.4",
+    "https-proxy-agent": "^7.0.5",
+    "socks-proxy-agent": "^8.0.4",
+    "viem": "^2.21.0"
+  }
 }
